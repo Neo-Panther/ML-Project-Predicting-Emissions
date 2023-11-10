@@ -6,6 +6,4 @@ The folder submitted is Team16_Project. (Link as Google Drive folder and zip fil
 
 .ipynb -> .pdf
 
-> pip install -U notebook-as-pdf
-> pyppeteer-install
 > jupyter-nbconvert --to PDFviaHTML Team16_Project.ipynb
