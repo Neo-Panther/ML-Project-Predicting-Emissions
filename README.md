@@ -7,3 +7,7 @@ The folder submitted is Team16_Project. (Link as Google Drive folder and zip fil
 .ipynb -> .pdf
 
 > jupyter-nbconvert --to PDFviaHTML Team16_Project.ipynb
+
+# REMEMBER
+
+1. Check for every model, does it need standardization/outlier removal/categorical 1 hot encoding?
