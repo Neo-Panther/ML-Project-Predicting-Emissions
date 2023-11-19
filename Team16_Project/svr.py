@@ -271,10 +271,7 @@ class SVR():
         self.alphas[j] = max(min(self.alphas[j], upper_bound), lower_bound)
         self._debug_print('A_j,new,cli =', self.alphas[j])
 
-        if abs(self.alphas[j] - alpha_j_old) < 1e-5:
-            self._debug_print('A_j changes too small.')
-            self._is_changed[j] = 1
-            return 0
+        33
 
         # update i
         self.alphas[i] += alpha_j_old - self.alphas[j]

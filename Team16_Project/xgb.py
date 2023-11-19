@@ -1,285 +1,213 @@
 import numpy as np
 import pandas as pd
-from math import e
 
 class Node:
-    
-    '''
-    A node object that is recursivly called within itslef to construct a regression tree. Based on Tianqi Chen's XGBoost 
-    the internal gain used to find the optimal split value uses both the gradient and hessian. Also a weighted quantlie sketch 
-    and optimal leaf values all follow Chen's description in "XGBoost: A Scalable Tree Boosting System" the only thing not 
-    implemented in this version is sparsity aware fitting or the ability to handle NA values with a default direction.
-
-    Inputs
-    ------------------------------------------------------------------------------------------------------------------
-    x: pandas datframe of the training data
-    gradient: negative gradient of the loss function
-    hessian: second order derivative of the loss function
-    idxs: used to keep track of samples within the tree structure
-    subsample_cols: is an implementation of layerwise column subsample randomizing the structure of the trees
-    (complexity parameter)
-    min_leaf: minimum number of samples for a node to be considered a node (complexity parameter)
-    min_child_weight: sum of the heassian inside a node is a meaure of purity (complexity parameter)
-    depth: limits the number of layers in the tree
-    lambda: L2 regularization term on weights. Increasing this value will make model more conservative.
-    gamma: This parameter also prevents over fitting and is present in the the calculation of the gain (structure score). 
-    As this is subtracted from the gain it essentially sets a minimum gain amount to make a split in a node.
-    eps: This parameter is used in the quantile weighted skecth or 'approx' tree method roughly translates to 
-    (1 / sketch_eps) number of bins
-
-    Outputs
-    --------------------------------------------------------------------------------------------------------------------
-    A single tree object that will be used for gradient boosintg.
-    '''
-
-    def __init__(self, x, gradient, hessian, idxs, subsample_cols = 0.8 , min_leaf = 5, min_child_weight = 1 ,depth = 10, lambda_ = 1, gamma = 1, eps = 0.1):
+  def __init__(self, x, y, grad, hess, depth = 6, gamma = 0, min_child_weight = 1, lambda_ = 1, colsample = 1):
+      self.x = x
+      self.y = y
+      self.grad = grad
+      self.hess = hess
+      self.depth = depth
+      self.gamma = gamma
+      self.lambda_ = lambda_
+      self.min_child_weight = min_child_weight
+      self.colsample = colsample
+      self.cols = np.random.permutation(x.shape[1])[:round(colsample * x.shape[1])]
+      self.sim_score = self.similarity_score([True]*x.shape[0])
+      self.gain = float("-inf")
       
-        self.x, self.gradient, self.hessian = x, gradient, hessian
-        self.idxs = idxs 
-        self.depth = depth
-        self.min_leaf = min_leaf
-        self.lambda_ = lambda_
-        self.gamma  = gamma
-        self.min_child_weight = min_child_weight
-        self.row_count = len(idxs)
-        self.col_count = x.shape[1]
-        self.subsample_cols = subsample_cols
-        self.eps = eps
-        self.column_subsample = np.random.permutation(self.col_count)[:round(self.subsample_cols*self.col_count)]
+      self.split_col = None
+      self.split_row = None
+      self.lhs_tree = None
+      self.rhs_tree = None
+      self.pivot = None
+      self.val = None
+      # making split
+      self.split_node()
+      
+      if self.is_leaf:
+          self.val = - np.sum(grad) / (np.sum(hess) + lambda_)
+      
+  
+  def split_node(self):
+    self.find_split()
+    
+    # checking whether it's a leaf or not
+    if self.is_leaf:
+      return
+    
+    x = self.x[:, self.split_col]
+    lhs = x <= x[self.split_row]
+    rhs = x > x[self.split_row]
+    
+    # creating further nodes recursivly
+    self.lhs_tree = Node(
+      self.x[lhs],
+      self.y[lhs],
+      self.grad[lhs],
+      self.hess[lhs],
+      depth = self.depth - 1,
+      gamma = self.gamma,
+      min_child_weight = self.min_child_weight,
+      lambda_ = self.lambda_,
+      colsample = self.colsample
+    )
+    
+    self.rhs_tree = Node(
+      self.x[rhs],
+      self.y[rhs],
+      self.grad[rhs],
+      self.hess[rhs],
+      depth = self.depth - 1,
+      gamma = self.gamma,
+      min_child_weight = self.min_child_weight,
+      lambda_ = self.lambda_,
+      colsample = self.colsample
+    )
+    
+  def find_split(self):
+    # iterate through every feature and row
+    for c in self.cols:
+      x = self.x[:, c]
+      for row in range(self.x.shape[0]):
+        pivot= x[row]
+        lhs = x <= pivot
+        rhs = x > pivot
+        sim_lhs = self.similarity_score(lhs)
+        sim_rhs = self.similarity_score(rhs)
+        gain = sim_lhs + sim_rhs - self.sim_score - self.gamma
         
-        self.val = self.compute_gamma(self.gradient[self.idxs], self.hessian[self.idxs])
+        if gain < 0 or self.not_valid_split(lhs) or self.not_valid_split(rhs):
+          continue
+        
+        if gain > self.gain:
+          self.split_col = c
+          self.split_row = row
+          self.pivot = pivot
+          self.gain = gain
+                  
+  def not_valid_split(self, masks):
+    if np.sum(self.hess[masks]) < self.min_child_weight:
+      return True
+    return False
+  
+  @property
+  def is_leaf(self):
+    if self.depth < 0 or self.gain == float("-inf"):
+      return True
+    return False
+              
+  def similarity_score(self, masks):
+    return np.sum(self.grad[masks]) ** 2 / ( np.sum(self.hess[masks]) + self.lambda_ )
+  
+  
+  def predict(self, x):
+    return np.array([self.predict_single_val(row) for row in x])
+  
+  def predict_single_val(self, x):
+    if self.is_leaf:
+      return self.val
+    
+    return self.lhs_tree.predict_single_val(x) if x[self.split_col] <= self.pivot else self.rhs_tree.predict_single_val(x)
+
+class XGBTree:
+  def __init__(self, x, y, grad, hess, depth = 6, gamma = 0, min_child_weight = 1, lambda_ = 1, colsample = 1, subsample = 1):
+    indices = np.random.permutation(x.shape[0])[:round(subsample * x.shape[0])]
+    
+    self.tree = Node(
+      x[indices],
+      y[indices],
+      grad[indices],
+      hess[indices],
+      depth = depth,
+      gamma = gamma,
+      min_child_weight = min_child_weight,
+      lambda_ =  lambda_,
+      colsample = colsample,
+    )
+  
+  def predict(self, x):
+    return self.tree.predict(x)
+    
+class XGBRegressor:
+  def __init__(self, eta = 0.3, n_estimators = 100, max_depth = 6, gamma = 0, min_child_weight = 1, lambda_ = 1, colsample = 1, subsample = 1):
+    self.eta = eta
+    self.n_estimators = n_estimators
+    self.max_depth = max_depth
+    self.gamma = gamma
+    self.min_child_weight = min_child_weight
+    self.lambda_ = lambda_
+    self.colsample = colsample
+    self.subsample = subsample
+    self.history = {
+        "train" : list(),
+        "test" : list()
+    }
+    
+    # list of all weak learners
+    self.trees = list()
+    
+    self.base_pred = None
+      
+  def fit(self, x, y, eval_set = None):
+    # checking Datatypes
+    if isinstance(x, pd.DataFrame) or isinstance(x, pd.Series):
+      x = x.values
+    if not isinstance(x, np.ndarray):
+        raise TypeError("Input should be pandas Dataframe/Series or numpy array.")
+        
+    if isinstance(y, pd.DataFrame) or isinstance(y, pd.Series):
+        y = y.values
+    if not isinstance(y, np.ndarray):
+        raise TypeError("Input should be pandas Dataframe/Series or numpy array.")
+    
+    
+    
+    base_pred = np.full(y.shape, np.mean(y)).astype("float64")
+    self.base_pred = np.mean(y)
+    for n in range(self.n_estimators):
+        grad = self.grad(y, base_pred)
+        hess = self.hess(y, base_pred)
+        estimator = XGBTree(
+            x,
+            y,
+            grad,
+            hess,
+            depth = self.max_depth,
+            gamma = self.gamma,
+            min_child_weight = self.min_child_weight,
+            lambda_ = self.lambda_,
+            colsample = self.colsample,
+            subsample = self.subsample
+        )
+        base_pred = base_pred + self.eta * estimator.predict(x)
+        self.trees.append(estimator)
+        
+        if eval_set:
+            X = eval_set[0]
+            Y = eval_set[1]
+            cost = np.sqrt(np.mean(self.loss(Y, self.predict(X))))
+            self.history["test"].append(cost)
+            print(f"[{n}] validation_set-rmse : {cost}", end="\t")
+        
+        cost = np.sqrt(np.mean(self.loss(y, base_pred)))
+        self.history["train"].append(cost)
+        print(f"[{n}] train_set-rmse : {cost}")
           
-        self.score = float('-inf')
-        self.find_varsplit()
-        
-        
-    def compute_gamma(self, gradient, hessian):
-        '''
-        Calculates the optimal leaf value equation (5) in "XGBoost: A Scalable Tree Boosting System"
-        '''
-        return(-np.sum(gradient)/(np.sum(hessian) + self.lambda_))
-        
-    def find_varsplit(self):
-        '''
-        Scans through every column and calcuates the best split point.
-        The node is then split at this point and two new nodes are created.
-        Depth is only parameter to change as we have added a new layer to tre structure.
-        If no split is better than the score initalised at the begining then no splits further splits are made
-        '''
-        for c in self.column_subsample: self.weighted_qauntile_sketch(c)
-        if self.is_leaf: return
-        x = self.split_col
-        lhs = np.nonzero(x <= self.split)[0]
-        rhs = np.nonzero(x > self.split)[0]
-        self.lhs = Node(x = self.x, gradient = self.gradient, hessian = self.hessian, idxs = self.idxs[lhs], min_leaf = self.min_leaf, depth = self.depth-1, lambda_ = self.lambda_ , gamma = self.gamma, min_child_weight = self.min_child_weight, eps = self.eps, subsample_cols = self.subsample_cols)
-        self.rhs = Node(x = self.x, gradient = self.gradient, hessian = self.hessian, idxs = self.idxs[rhs], min_leaf = self.min_leaf, depth = self.depth-1, lambda_ = self.lambda_ , gamma = self.gamma, min_child_weight = self.min_child_weight, eps = self.eps, subsample_cols = self.subsample_cols)
-        
-    def find_greedy_split(self, var_idx):
-        '''
-         For a given feature greedily calculates the gain at each split.
-         Globally updates the best score and split point if a better split point is found
-        '''
-        x = self.x[self.idxs, var_idx]
-        
-        for r in range(self.row_count):
-            lhs = x <= x[r]
-            rhs = x > x[r]
-            
-            lhs_indices = np.nonzero(x <= x[r])[0]
-            rhs_indices = np.nonzero(x > x[r])[0]
-            if(rhs.sum() < self.min_leaf or lhs.sum() < self.min_leaf 
-               or self.hessian[lhs_indices].sum() < self.min_child_weight
-               or self.hessian[rhs_indices].sum() < self.min_child_weight): continue
-
-            curr_score = self.gain(lhs, rhs)
-            if curr_score > self.score: 
-                self.var_idx = var_idx
-                self.score = curr_score
-                self.split = x[r]
-                
-    def weighted_qauntile_sketch(self, var_idx):
-        '''
-        XGBOOST Mini-Version
-        Yiyang "Joe" Zeng
-        Is an approximation to the eact greedy approach faster for bigger datasets wher it is not feasible
-        to calculate the gain at every split point. Uses equation (8) and (9) from "XGBoost: A Scalable Tree Boosting System"
-        '''
-        x = self.x[self.idxs, var_idx]
-        hessian_ = self.hessian[self.idxs]
-        df = pd.DataFrame({'feature':x,'hess':hessian_})
-        
-        df.sort_values(by=['feature'], ascending = True, inplace = True)
-        hess_sum = df['hess'].sum() 
-        df['rank'] = df.apply(lambda x : (1/hess_sum)*sum(df[df['feature'] < x['feature']]['hess']), axis=1)
-        
-        for row in range(df.shape[0]-1):
-            # look at the current rank and the next ran
-            rk_sk_j, rk_sk_j_1 = df['rank'].iloc[row:row+2]
-            diff = abs(rk_sk_j - rk_sk_j_1)
-            if(diff >= self.eps):
-                continue
-                
-            split_value = (df['rank'].iloc[row+1] + df['rank'].iloc[row])/2
-            lhs = x <= split_value
-            rhs = x > split_value
-            
-            lhs_indices = np.nonzero(x <= split_value)[0]
-            rhs_indices = np.nonzero(x > split_value)[0]
-            if(rhs.sum() < self.min_leaf or lhs.sum() < self.min_leaf 
-               or self.hessian[lhs_indices].sum() < self.min_child_weight
-               or self.hessian[rhs_indices].sum() < self.min_child_weight): continue
-                
-            curr_score = self.gain(lhs, rhs)
-            if curr_score > self.score: 
-                self.var_idx = var_idx
-                self.score = curr_score
-                self.split = split_value
-                
-    def gain(self, lhs, rhs):
-        '''
-        Calculates the gain at a particular split point bases on equation (7) from
-        "XGBoost: A Scalable Tree Boosting System"
-        '''
-        gradient = self.gradient[self.idxs]
-        hessian  = self.hessian[self.idxs]
-        
-        lhs_gradient = gradient[lhs].sum()
-        lhs_hessian  = hessian[lhs].sum()
-        
-        rhs_gradient = gradient[rhs].sum()
-        rhs_hessian  = hessian[rhs].sum()
-        
-        gain = 0.5 *( (lhs_gradient**2/(lhs_hessian + self.lambda_)) + (rhs_gradient**2/(rhs_hessian + self.lambda_)) - ((lhs_gradient + rhs_gradient)**2/(lhs_hessian + rhs_hessian + self.lambda_))) - self.gamma
-        return(gain)
-                
-    @property
-    def split_col(self):
-        '''
-        splits a column 
-        '''
-        return self.x[self.idxs , self.var_idx]
-                
-    @property
-    def is_leaf(self):
-        '''
-        checks if node is a leaf
-        '''
-        return self.score == float('-inf') or self.depth <= 0                 
-
-    def predict(self, x):
-        return np.array([self.predict_row(xi) for xi in x])
-    
-    def predict_row(self, xi):
-        if self.is_leaf:
-            return(self.val)
-
-        node = self.lhs if xi[self.var_idx] <= self.split else self.rhs
-        return node.predict_row(xi)
-
-    
-class XGBoostTree:
-    '''
-    Wrapper class that provides a scikit learn interface to the recursive regression tree above
-    
-    Inputs
-    ------------------------------------------------------------------------------------------------------------------
-    x: pandas datframe of the training data
-    gradient: negative gradient of the loss function
-    hessian: second order derivative of the loss function
-    idxs: used to keep track of samples within the tree structure
-    subsample_cols: is an implementation of layerwise column subsample randomizing the structure of the trees
-    (complexity parameter)
-    min_leaf: minimum number of samples for a node to be considered a node (complexity parameter)
-    min_child_weight: sum of the heassian inside a node is a meaure of purity (complexity parameter)
-    depth: limits the number of layers in the tree
-    lambda: L2 regularization term on weights. Increasing this value will make model more conservative.
-    gamma: This parameter also prevents over fitting and is present in the the calculation of the gain (structure score). 
-    As this is subtracted from the gain it essentially sets a minimum gain amount to make a split in a node.
-    eps: This parameter is used in the quantile weighted skecth or 'approx' tree method roughly translates to 
-    (1 / sketch_eps) number of bins
-    
-    Outputs
-    --------------------------------------------------------------------------------------------------------------------
-    A single tree object that will be used for gradient boosintg.
-    
-    '''
-    def fit(self, x, gradient, hessian, subsample_cols = 0.8 , min_leaf = 5, min_child_weight = 1 ,depth = 10, lambda_ = 1, gamma = 1, eps = 0.1):
-        self.dtree = Node(x, gradient, hessian, np.array(np.arange(len(x))), subsample_cols, min_leaf, min_child_weight, depth, lambda_, gamma, eps)
-        return self
-    
-    def predict(self, X):
-        return self.dtree.predict(X)
-   
-       
-class XGBoostRegressor:
-    '''
-    Full application of the XGBoost algorithm as described in "XGBoost: A Scalable Tree Boosting System" for 
-    regression.
-
-    Inputs
-    ------------------------------------------------------------------------------------------------------------------
-    x: pandas datframe of the training data
-    gradient: negative gradient of the loss function
-    hessian: second order derivative of the loss function
-    idxs: used to keep track of samples within the tree structure
-    subsample_cols: is an implementation of layerwise column subsample randomizing the structure of the trees
-    (complexity parameter)
-    min_leaf: minimum number of samples for a node to be considered a node (complexity parameter)
-    min_child_weight: sum of the heassian inside a node is a meaure of purity (complexity parameter)
-    depth: limits the number of layers in the tree
-    lambda: L2 regularization term on weights. Increasing this value will make model more conservative.
-    gamma: This parameter also prevents over fitting and is present in the the calculation of the gain (structure score). 
-    As this is subtracted from the gain it essentially sets a minimum gain amount to make a split in a node.
-    eps: This parameter is used in the quantile weighted skecth or 'approx' tree method roughly translates to 
-    (1 / sketch_eps) number of bins
-
-    Outputs
-    --------------------------------------------------------------------------------------------------------------------
-    A single tree object that will be used for gradient boosintg.
-    '''
-    def __init__(self):
-        self.estimators = []
-    
-    # first order gradient mean squared error
-    @staticmethod
-    def grad(preds, labels):
-        return(2*(preds-labels))
-    
-    # second order gradient logLoss
-    @staticmethod
-    def hess(preds, labels):
-        '''
-        hessian of mean squared error is a constant value of two 
-        returns an array of twos
-        '''
-        return(np.full((preds.shape[0], 1), 2).flatten().astype('float64'))
-    
-    
-    def fit(self, X, y, subsample_cols = 0.8 , min_child_weight = 1, depth = 5, min_leaf = 5, learning_rate = 0.4, boosting_rounds = 5, lambda_ = 1.5, gamma = 1, eps = 0.1):
-        self.X, self.y = X, y
-        self.depth = depth
-        self.subsample_cols = subsample_cols
-        self.eps = eps
-        self.min_child_weight = min_child_weight 
-        self.min_leaf = min_leaf
-        self.learning_rate = learning_rate
-        self.boosting_rounds = boosting_rounds 
-        self.lambda_ = lambda_
-        self.gamma  = gamma
-    
-        self.base_pred = np.full((X.shape[0], 1), np.mean(y)).flatten().astype('float64')
-    
-        for booster in range(self.boosting_rounds):
-            Grad = self.grad(self.base_pred, self.y)
-            Hess = self.hess(self.base_pred, self.y)
-            boosting_tree = XGBoostTree().fit(self.X, Grad, Hess, depth = self.depth, min_leaf = self.min_leaf, lambda_ = self.lambda_, gamma = self.gamma, eps = self.eps, min_child_weight = self.min_child_weight, subsample_cols = self.subsample_cols)
-            self.base_pred += self.learning_rate * boosting_tree.predict(self.X)
-            self.estimators.append(boosting_tree)
-          
-    def predict(self, X):
-        pred = np.zeros(X.shape[0])
-        
-        for estimator in self.estimators:
-            pred += self.learning_rate * estimator.predict(X) 
-          
-        return np.full((X.shape[0], 1), np.mean(self.y)).flatten().astype('float64') + pred
+  def predict(self, x):
+      base_pred = np.full((x.shape[0],), self.base_pred).astype("float64")
+      for tree in self.trees:
+          base_pred += self.eta * tree.predict(x)
+      
+      return base_pred
+  
+  def loss(self, y, a):
+      return (y - a)**2
+  
+  def grad(self, y, a):
+      # for 0.5 * (y - a)**2
+      return a - y
+  
+  def hess(self, y, a):
+      # for 0.5 * (y - a)**2
+      return np.full((y.shape), 1)
